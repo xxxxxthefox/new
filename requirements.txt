@@ -1,6 +1,6 @@
 Flask
 Flask-JWT-Extended
 Flask-Talisman
-GitPython
 bcrypt
 bleach
+gunicorn
