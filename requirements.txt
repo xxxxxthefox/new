@@ -1,6 +1,9 @@
 Flask
-Flask-JWT-Extended
-Flask-Talisman
+werkzeug
 bcrypt
 bleach
-gunicorn
+Flask-JWT-Extended
+flask-talisman
+Flask-Limiter
+requests
+pysqlite3-binary
