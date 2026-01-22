@@ -1,7 +1,7 @@
 Flask
-flask-jwt-extended
-flask-limiter
-flask-talisman
+Flask-JWT-Extended
+Flask-Limiter
+Flask-Talisman
 bcrypt
-requests
 bleach
+gunicorn
