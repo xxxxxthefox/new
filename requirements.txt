@@ -1,0 +1,7 @@
+Flask
+flask-jwt-extended
+flask-limiter
+flask-talisman
+bcrypt
+requests
+bleach
