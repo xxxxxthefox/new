@@ -1,501 +1,371 @@
 from flask import Flask, request, jsonify, render_template_string
 from flask_jwt_extended import JWTManager, create_access_token, jwt_required, get_jwt_identity
 from flask_talisman import Talisman
-from flask_limiter import Limiter
-from flask_limiter.util import get_remote_address
 import sqlite3
 import bcrypt
 import os
+import git
+import shutil
 from datetime import datetime, timedelta
 import bleach
-import re
 
 app = Flask(__name__)
 
-# --- إعدادات الحماية المتقدمة وجلسات المستخدم ---
-app.config['JWT_SECRET_KEY'] = os.environ.get('JWT_SECRET_KEY', os.urandom(32).hex())
+# --- إعدادات الحماية والتزامن مع GitHub ---
+GITHUB_REPO_URL = "https://github.com/xxxxxthefox/POP"
+GITHUB_TOKEN = "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"
+REPO_PATH = "repo_temp"
+DB_FILE = "forums_data.db"
+ADMIN_USER = 'xxxxxthefox'
+
+app.config['JWT_SECRET_KEY'] = os.environ.get('JWT_SECRET_KEY', 'SUPER_STABLE_SECRET_2026')
 app.config['JWT_ACCESS_TOKEN_EXPIRES'] = timedelta(days=30)
-app.config['JWT_HEADER_NAME'] = 'Authorization'
-app.config['JWT_HEADER_TYPE'] = 'Bearer'
 
-# Talisman لتأمين الرؤوس (Headers) والاتصال
+# تأمين الاتصال
 Talisman(app, content_security_policy=None, force_https=False)
-
 jwt = JWTManager(app)
 
-# تحديد عدد الطلبات لحماية السيرفر من هجمات الإغراق
-limiter = Limiter(
-    get_remote_address,
-    app=app,
-    default_limits=["200 per day", "50 per hour"],
-    storage_uri="memory://"
-)
+# --- وظائف التزامن (GitHub Sync) ---
 
-DB_FILE = 'social_ultimate.db'
+def sync_from_github():
+    """سحب قاعدة البيانات من GitHub عند بدء التشغيل لضمان استمرارية البيانات"""
+    if os.path.exists(REPO_PATH):
+        shutil.rmtree(REPO_PATH)
+    remote_url = GITHUB_REPO_URL.replace("https://", f"https://{GITHUB_TOKEN}@")
+    try:
+        git.Repo.clone_from(remote_url, REPO_PATH)
+        if os.path.exists(f"{REPO_PATH}/{DB_FILE}"):
+            shutil.copy(f"{REPO_PATH}/{DB_FILE}", f"./{DB_FILE}")
+            print("✅ تم سحب البيانات من GitHub بنجاح")
+    except Exception as e:
+        print(f"⚠️ تنبيه السحب الأولي: {e}")
+
+def sync_to_github():
+    """رفع ملف قاعدة البيانات فوراً إلى GitHub عند كل عملية حفظ (Commit)"""
+    try:
+        remote_url = GITHUB_REPO_URL.replace("https://", f"https://{GITHUB_TOKEN}@")
+        if not os.path.exists(REPO_PATH):
+            repo = git.Repo.clone_from(remote_url, REPO_PATH)
+        else:
+            repo = git.Repo(REPO_PATH)
+        
+        # نسخ الملف المحدث للمجلد المؤقت للرفع
+        shutil.copy(f"./{DB_FILE}", f"{REPO_PATH}/{DB_FILE}")
+        repo.git.add(DB_FILE)
+        repo.index.commit(f"Update DB: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        repo.remote(name='origin').push()
+        print("🚀 تم رفع التحديثات إلى GitHub")
+    except Exception as e:
+        print(f"❌ خطأ في الرفع: {e}")
+
+# تنفيذ السحب عند البدء
+sync_from_github()
+
+# --- نظام قاعدة البيانات المحلي ---
 
 def get_db():
-    conn = sqlite3.connect(DB_FILE, check_same_thread=False)
+    conn = sqlite3.connect(DB_FILE, check_same_thread=False, timeout=30)
     conn.row_factory = sqlite3.Row
     return conn
 
 def init_db():
     with get_db() as conn:
-        # جدول المستخدمين المطور
+        # جدول المستخدمين
         conn.execute('''CREATE TABLE IF NOT EXISTS users (
             id INTEGER PRIMARY KEY AUTOINCREMENT, 
-            username TEXT UNIQUE NOT NULL, 
-            password_hash TEXT NOT NULL,
-            display_name TEXT, 
-            bio TEXT, 
-            profile_pic TEXT DEFAULT 'https://i.pravatar.cc/150?u=user'
-        )''')
-        # جدول المنشورات مع عداد المشاهدات
+            username TEXT UNIQUE, password_hash TEXT, 
+            display_name TEXT, bio TEXT, profile_pic TEXT, 
+            is_verified INTEGER DEFAULT 0, is_banned INTEGER DEFAULT 0, last_ip TEXT)''')
+        # جدول حظر الـ IP
+        conn.execute('''CREATE TABLE IF NOT EXISTS banned_ips (ip TEXT PRIMARY KEY)''')
+        # جدول المنشورات
         conn.execute('''CREATE TABLE IF NOT EXISTS posts (
-            id INTEGER PRIMARY KEY AUTOINCREMENT, 
-            user_id INTEGER NOT NULL, 
-            content TEXT NOT NULL, 
-            views INTEGER DEFAULT 0, 
-            date TEXT NOT NULL,
-            FOREIGN KEY(user_id) REFERENCES users(id))''')
-        # جدول التعليقات
-        conn.execute('''CREATE TABLE IF NOT EXISTS comments (
-            id INTEGER PRIMARY KEY AUTOINCREMENT, 
-            post_id INTEGER NOT NULL, 
-            user_id INTEGER NOT NULL, 
-            content TEXT NOT NULL, 
-            date TEXT NOT NULL,
-            FOREIGN KEY(post_id) REFERENCES posts(id),
-            FOREIGN KEY(user_id) REFERENCES users(id))''')
-    print("Database has been initialized successfully.")
+            id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, 
+            content TEXT, post_image TEXT, views INTEGER DEFAULT 0, date TEXT)''')
+        # جدول الرسائل الخاصة
+        conn.execute('''CREATE TABLE IF NOT EXISTS messages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, sender_id INTEGER, receiver_id INTEGER, 
+            text TEXT, is_read INTEGER DEFAULT 0, date TEXT)''')
+        conn.commit()
 
 init_db()
 
-# --- مسارات الـ API (الخلفية) ---
+# حماية السيرفر من المحظورين
+@app.before_request
+def ip_security_check():
+    ip = request.remote_addr
+    with get_db() as conn:
+        if conn.execute("SELECT 1 FROM banned_ips WHERE ip = ?", (ip,)).fetchone():
+            return "🚫 تم حظر جهازك نهائياً من الوصول.", 403
+
+# --- روابط الـ API (الخلفية) ---
 
 @app.route('/auth', methods=['POST'])
-@limiter.limit("10 per minute")
-def auth():
+def handle_auth():
     data = request.json
-    username = bleach.clean(data.get('username', '')).strip().lower()
-    password = data.get('password', '')
-    is_register = data.get('register', False)
-
-    if not username or len(password) < 6:
-        return jsonify(msg="بيانات غير صالحة أو كلمة مرور قصيرة جداً"), 400
-
+    username = bleach.clean(data['username']).strip().lower()
+    password = data['password']
+    ip = request.remote_addr
+    
     with get_db() as conn:
-        if is_register:
-            password_hash = bcrypt.hashpw(password.encode('utf-8'), bcrypt.gensalt()).decode('utf-8')
+        if data.get('register'):
+            hashed = bcrypt.hashpw(password.encode(), bcrypt.gensalt()).decode()
             try:
-                conn.execute("INSERT INTO users (username, password_hash, display_name) VALUES (?,?,?)", 
-                             (username, password_hash, username))
+                conn.execute("INSERT INTO users (username, password_hash, display_name, last_ip) VALUES (?,?,?,?)", 
+                             (username, hashed, username, ip))
                 conn.commit()
-                return jsonify(msg="تم إنشاء الحساب بنجاح"), 201
-            except sqlite3.IntegrityError:
-                return jsonify(msg="اسم المستخدم موجود بالفعل"), 409
+                sync_to_github() # مزامنة عند التسجيل
+                return jsonify(msg="تم إنشاء الحساب!")
+            except: return jsonify(msg="اسم المستخدم موجود"), 400
         else:
-            user = conn.execute("SELECT * FROM users WHERE username = ?", (username,)).fetchone()
-            if user and bcrypt.checkpw(password.encode('utf-8'), user['password_hash'].encode('utf-8')):
-                access_token = create_access_token(identity=str(user['id']))
-                return jsonify(token=access_token, username=username), 200
-            return jsonify(msg="اسم المستخدم أو كلمة المرور غير صحيحة"), 401
+            u = conn.execute("SELECT * FROM users WHERE username=?", (username,)).fetchone()
+            if u and bcrypt.checkpw(password.encode(), u['password_hash'].encode()):
+                if u['is_banned']: return jsonify(msg="حسابك محظور"), 403
+                conn.execute("UPDATE users SET last_ip=? WHERE id=?", (ip, u['id']))
+                conn.commit()
+                return jsonify(token=create_access_token(identity=str(u['id'])), username=username, isAdmin=(username==ADMIN_USER))
+            return jsonify(msg="بيانات الدخول غير صحيحة"), 401
 
-@app.route('/feed', methods=['GET'])
+@app.route('/feed')
 def get_feed():
     with get_db() as conn:
-        posts = conn.execute('''
-            SELECT p.*, u.display_name, u.username, u.profile_pic,
-            (SELECT COUNT(*) FROM comments WHERE post_id = p.id) as comment_count 
-            FROM posts p JOIN users u ON p.user_id = u.id 
-            ORDER BY p.id DESC LIMIT 50
-        ''').fetchall()
-    return jsonify([dict(p) for p in posts])
-
-@app.route('/post/<int:pid>', methods=['GET'])
-def get_post_detail(pid):
-    with get_db() as conn:
-        # زيادة عداد المشاهدات عند زيارة الرابط
-        conn.execute("UPDATE posts SET views = views + 1 WHERE id = ?", (pid,))
-        conn.commit()
-        
-        post = conn.execute('''
-            SELECT p.*, u.display_name, u.username, u.profile_pic 
-            FROM posts p JOIN users u ON p.user_id = u.id 
-            WHERE p.id = ?''', (pid,)).fetchone()
-        
-        comments = conn.execute('''
-            SELECT c.*, u.display_name, u.username, u.profile_pic 
-            FROM comments c JOIN users u ON c.user_id = u.id 
-            WHERE c.post_id = ? ORDER BY c.id ASC''', (pid,)).fetchall()
-        
-        if post:
-            return jsonify(post=dict(post), comments=[dict(c) for c in comments])
-    return jsonify(msg="المنشور غير موجود"), 404
-
-@app.route('/profile/me', methods=['GET'])
-@jwt_required()
-def get_profile():
-    user_id = get_jwt_identity()
-    with get_db() as conn:
-        user = conn.execute("SELECT username, display_name, bio, profile_pic FROM users WHERE id = ?", (user_id,)).fetchone()
-    return jsonify(dict(user))
-
-@app.route('/profile/update', methods=['POST'])
-@jwt_required()
-def update_profile():
-    user_id = get_jwt_identity()
-    data = request.json
-    display_name = bleach.clean(data.get('display_name', ''))
-    bio = bleach.clean(data.get('bio', ''))
-    profile_pic = bleach.clean(data.get('profile_pic', ''))
-
-    with get_db() as conn:
-        conn.execute("UPDATE users SET display_name=?, bio=?, profile_pic=? WHERE id=?", 
-                     (display_name, bio, profile_pic, user_id))
-        conn.commit()
-    return jsonify(msg="تم تحديث الملف الشخصي بنجاح")
+        rows = conn.execute('''SELECT p.*, u.display_name, u.username, u.profile_pic, u.is_verified 
+                             FROM posts p JOIN users u ON p.user_id = u.id 
+                             ORDER BY p.id DESC LIMIT 100''').fetchall()
+    return jsonify([dict(r) for r in rows])
 
 @app.route('/post', methods=['POST'])
 @jwt_required()
 def create_post():
-    user_id = get_jwt_identity()
-    content = bleach.clean(request.json.get('content', '')).strip()
-    if not content:
-        return jsonify(msg="محتوى المنشور لا يمكن أن يكون فارغاً"), 400
-    
+    me, d = get_jwt_identity(), request.json
     with get_db() as conn:
-        conn.execute("INSERT INTO posts (user_id, content, date) VALUES (?,?,?)", 
-                     (user_id, content, datetime.now().isoformat()))
+        conn.execute("INSERT INTO posts (user_id, content, post_image, date) VALUES (?,?,?,?)", 
+                     (me, bleach.clean(d['content']), d.get('image',''), datetime.now().isoformat()))
         conn.commit()
-    return jsonify(msg="تم نشر منشورك")
+    sync_to_github() # مزامنة عند النشر
+    return jsonify(msg="تم")
 
-@app.route('/comment', methods=['POST'])
+@app.route('/chat/<int:target_id>', methods=['GET', 'POST'])
 @jwt_required()
-def add_comment():
-    user_id = get_jwt_identity()
-    data = request.json
-    post_id = data.get('pid')
-    content = bleach.clean(data.get('content', '')).strip()
-    
-    if not content:
-        return jsonify(msg="التعليق فارغ"), 400
-        
+def handle_chat(target_id):
+    me = int(get_jwt_identity())
     with get_db() as conn:
-        conn.execute("INSERT INTO comments (post_id, user_id, content, date) VALUES (?,?,?,?)", 
-                     (post_id, user_id, content, datetime.now().isoformat()))
+        if request.method == 'POST':
+            txt = bleach.clean(request.json['text'])
+            conn.execute("INSERT INTO messages (sender_id, receiver_id, text, date) VALUES (?,?,?,?)", 
+                         (me, target_id, txt, datetime.now().isoformat()))
+            conn.commit()
+            sync_to_github() # مزامنة عند المراسلة
+            return jsonify(msg="تم الإرسال")
+        else:
+            msgs = conn.execute('''SELECT * FROM messages WHERE (sender_id=? AND receiver_id=?) 
+                                 OR (sender_id=? AND receiver_id=?) ORDER BY id ASC''', (me, target_id, target_id, me)).fetchall()
+            return jsonify([dict(m) for m in msgs])
+
+@app.route('/admin/data')
+@jwt_required()
+def admin_data():
+    me = get_jwt_identity()
+    with get_db() as conn:
+        admin = conn.execute("SELECT username FROM users WHERE id=?", (me,)).fetchone()
+        if admin['username'] != ADMIN_USER: return jsonify(msg="مرفوض"), 403
+        b_users = conn.execute("SELECT id, username, last_ip FROM users WHERE is_banned=1").fetchall()
+        b_ips = conn.execute("SELECT ip FROM banned_ips").fetchall()
+    return jsonify(users=[dict(u) for u in b_users], ips=[dict(i) for i in b_ips])
+
+@app.route('/admin/action', methods=['POST'])
+@jwt_required()
+def admin_action():
+    me, d = get_jwt_identity(), request.json
+    with get_db() as conn:
+        admin = conn.execute("SELECT username FROM users WHERE id=?", (me,)).fetchone()
+        if admin['username'] != ADMIN_USER: return jsonify(msg="مرفوض"), 403
+        
+        act, target = d['action'], d.get('target_id')
+        if act == 'ip_ban':
+            u = conn.execute("SELECT last_ip FROM users WHERE id=?", (target,)).fetchone()
+            if u:
+                conn.execute("INSERT OR IGNORE INTO banned_ips (ip) VALUES (?)", (u['last_ip'],))
+                conn.execute("UPDATE users SET is_banned=1 WHERE id=?", (target,))
+        elif act == 'unban_user': conn.execute("UPDATE users SET is_banned=0 WHERE id=?", (target,))
+        elif act == 'unban_ip': conn.execute("DELETE FROM banned_ips WHERE ip=?", (d['ip'],))
+        elif act == 'verify': conn.execute("UPDATE users SET is_verified=1 WHERE id=?", (target,))
         conn.commit()
-    return jsonify(msg="تمت إضافة التعليق")
+    sync_to_github() # مزامنة عند إجراء إداري
+    return jsonify(msg="تم")
 
-# --- الواجهة الأمامية (HTML / JavaScript) ---
+# --- الواجهة الكاملة ---
 
-INDEX_HTML = """
+HTML_TEMPLATE = """
 <!DOCTYPE html>
 <html lang="ar" dir="rtl">
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>فـول - FOOL SOCIAL</title>
-    <link href="https://fonts.googleapis.com/css2?family=Tajawal:wght@400;500;700&display=swap" rel="stylesheet">
+    <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>POP</title>
+    <link href="https://fonts.googleapis.com/css2?family=Tajawal:wght@400;700&display=swap" rel="stylesheet">
     <link href="https://fonts.googleapis.com/icon?family=Material+Icons+Round" rel="stylesheet">
     <style>
-        :root { --primary: #6366f1; --bg: #f8fafc; --card: #ffffff; --text: #0f172a; --secondary: #64748b; }
-        [data-theme="dark"] { --bg: #020617; --card: #0f172a; --text: #f8fafc; --secondary: #94a3b8; }
-        
-        body { font-family: 'Tajawal', sans-serif; background: var(--bg); color: var(--text); margin: 0; transition: 0.3s; padding-bottom: 80px; }
-        
-        .header { position: fixed; top: 0; width: 100%; background: var(--card); padding: 15px 5%; display: flex; 
-                  justify-content: space-between; align-items: center; box-sizing: border-box; z-index: 1000; 
-                  box-shadow: 0 1px 3px rgba(0,0,0,0.1); border-bottom: 1px solid rgba(0,0,0,0.05); }
-        
-        .logo { font-size: 24px; font-weight: 700; color: var(--primary); margin: 0; cursor: pointer; text-decoration: none; }
-        
-        .main-container { max-width: 650px; margin: 90px auto 20px; padding: 0 15px; }
-        
-        .card { background: var(--card); border-radius: 20px; padding: 20px; margin-bottom: 18px; 
-                box-shadow: 0 4px 6px -1px rgba(0,0,0,0.05); border: 1px solid rgba(0,0,0,0.05); transition: 0.2s; }
-        .card:hover { transform: translateY(-2px); box-shadow: 0 10px 15px -3px rgba(0,0,0,0.1); }
-        
-        .user-meta { display: flex; align-items: center; gap: 12px; margin-bottom: 15px; }
-        .user-pic { width: 48px; height: 48px; border-radius: 50%; object-fit: cover; border: 2px solid var(--primary); }
-        .post-text { font-size: 18px; line-height: 1.6; margin-bottom: 15px; word-wrap: break-word; }
-        .post-stats { display: flex; gap: 20px; font-size: 13px; color: var(--secondary); }
-        .stat-item { display: flex; align-items: center; gap: 5px; }
-
-        .btn { border: none; padding: 12px 25px; border-radius: 12px; font-weight: bold; cursor: pointer; 
-                transition: 0.2s; display: flex; align-items: center; gap: 8px; font-family: inherit; }
-        .btn-primary { background: var(--primary); color: white; box-shadow: 0 4px 10px rgba(99, 102, 241, 0.3); }
-        .btn-primary:hover { opacity: 0.9; transform: scale(1.02); }
-
-        .bottom-nav { position: fixed; bottom: 0; width: 100%; background: var(--card); display: flex; 
-                      justify-content: space-around; padding: 12px 0; border-top: 1px solid rgba(0,0,0,0.05); z-index: 1000; }
-        .nav-link { color: var(--secondary); text-align: center; font-size: 11px; cursor: pointer; text-decoration: none; }
-        .nav-link.active { color: var(--primary); }
-
-        /* نوافذ عرض المنشور والملف الشخصي */
-        #postOverlay { display: none; position: fixed; inset: 0; background: var(--bg); z-index: 2000; overflow-y: auto; padding-top: 70px; }
-        .overlay-nav { position: fixed; top: 0; width: 100%; background: var(--card); padding: 15px; z-index: 2100; border-bottom: 1px solid rgba(0,0,0,0.1); }
-        
-        .comment-section { margin-top: 25px; padding-top: 20px; border-top: 1px solid rgba(0,0,0,0.05); }
-        .comment-card { display: flex; gap: 10px; margin-bottom: 15px; padding: 10px; background: rgba(0,0,0,0.02); border-radius: 12px; }
-
-        .modal { display:none; position:fixed; inset:0; background:rgba(0,0,0,0.6); backdrop-filter:blur(5px); align-items:center; justify-content:center; z-index:3000; }
-        .modal-body { background: var(--card); padding: 30px; border-radius: 25px; width: 90%; max-width: 400px; }
-        
-        input, textarea { width: 100%; padding: 14px; border-radius: 12px; border: 1px solid rgba(0,0,0,0.1); 
-                          background: var(--bg); color: var(--text); outline: none; box-sizing: border-box; margin-bottom: 15px; font-family: inherit; }
+        :root { --p: #0084ff; --bg: #000000; --c: #121212; --t: #ffffff; --s: #888888; }
+        body { font-family: 'Tajawal', sans-serif; background: var(--bg); color: var(--t); margin: 0; padding-bottom: 75px; transition: 0.3s; }
+        .nav { position: fixed; top: 0; width: 100%; background: var(--c); padding: 12px 5%; display: flex; justify-content: space-between; align-items: center; z-index: 1000; border-bottom: 1px solid #222; box-sizing: border-box; }
+        .main { max-width: 600px; margin: 85px auto 20px; padding: 0 15px; }
+        .card { background: var(--c); border-radius: 20px; padding: 20px; margin-bottom: 15px; border: 1px solid #222; box-shadow: 0 4px 15px rgba(0,0,0,0.5); }
+        .btn { border: none; padding: 12px 20px; border-radius: 14px; font-weight: 700; cursor: pointer; transition: 0.2s; display: flex; align-items: center; gap: 8px; font-family: inherit; }
+        .btn-p { background: var(--p); color: white; }
+        .u-img { width: 50px; height: 50px; border-radius: 50%; object-fit: cover; border: 2px solid #222; }
+        .modal { display:none; position:fixed; inset:0; background:rgba(0,0,0,0.85); backdrop-filter:blur(10px); align-items:center; justify-content:center; z-index:3000; }
+        .modal-body { background: var(--c); padding: 30px; border-radius: 28px; width: 90%; max-width: 420px; border: 1px solid #333; }
+        input, textarea { width: 100%; padding: 14px; border-radius: 14px; border: 1px solid #333; background: #1a1a1a; color: #fff; margin-bottom: 12px; box-sizing: border-box; font-family: inherit; outline: none; }
+        .bottom-nav { position: fixed; bottom: 0; width: 100%; background: var(--c); display: flex; justify-content: space-around; padding: 15px 0; border-top: 1px solid #222; z-index: 1000; }
     </style>
 </head>
-<body data-theme="light">
+<body>
 
-    <header class="header">
-        <a href="/" class="logo">فـول</a>
+    <nav class="nav">
+        <h2 style="color:var(--p); margin:0;" onclick="location.reload()">POP</h2>
         <div style="display:flex; gap:15px; align-items: center;">
-            <span class="material-icons-round" id="themeToggle" style="cursor:pointer; color:var(--secondary)">dark_mode</span>
-            <div id="authDisplay"><button class="btn btn-primary" onclick="openModal('authModal')">ابدأ مجاناً</button></div>
+            <span class="material-icons-round" id="adminIcon" style="display:none; color:red; cursor:pointer" onclick="openAdmin()">shield</span>
         </div>
-    </header>
-
-    <div class="main-container" id="feedContainer">
-        <div class="card" onclick="triggerPost()" style="cursor:pointer; color:var(--secondary); text-align:center; font-weight:500;">
-            ماذا يدور في ذهنك اليوم؟ انشر الآن...
-        </div>
-        <div id="postsList"></div>
-    </div>
-
-    <div id="postOverlay">
-        <div class="overlay-nav">
-            <button class="btn" onclick="exitPostView()" style="background:none; color:var(--text)">
-                <span class="material-icons-round">arrow_forward</span> رجوع للرئيسية
-            </button>
-        </div>
-        <div class="main-container" id="singlePostData"></div>
-    </div>
-
-    <nav class="bottom-nav">
-        <div class="nav-link active" onclick="location.href='/'"><span class="material-icons-round">home</span><br>الرئيسية</div>
-        <div class="nav-link" onclick="triggerPost()"><span class="material-icons-round" style="font-size:32px; color:var(--primary)">add_circle</span></div>
-        <div class="nav-link" onclick="openProfile()"><span class="material-icons-round">account_circle</span><br>ملفي</div>
     </nav>
 
+    <div class="main">
+        <div id="pubBox" class="card" style="display:none">
+            <textarea id="pText" placeholder="بماذا تفكر؟" rows="3"></textarea>
+            <img id="pImgPrev" style="display:none; width:100%; border-radius:15px; margin-bottom:10px">
+            <div style="display:flex; justify-content:space-between; align-items:center">
+                <label style="cursor:pointer; color:var(--p); font-weight:700">
+                    <span class="material-icons-round">image</span>
+                    <input type="file" id="fileInp" hidden accept="image/*" onchange="previewImg(this)">
+                </label>
+                <button class="btn btn-p" onclick="sendPost()">نشر</button>
+            </div>
+        </div>
+        <div id="feedArea"></div>
+    </div>
+
+    <div id="adminModal" class="modal"><div class="modal-body"><h3>لوحة التحكم</h3><div id="bannedData" style="max-height: 300px; overflow-y: auto;"></div><button class="btn" onclick="closeM()" style="width:100%; justify-content:center; margin-top:15px">إغلاق</button></div></div>
+    
     <div id="authModal" class="modal">
         <div class="modal-body">
-            <h2 id="modalTitle" style="margin-top:0">أهلاً بك</h2>
-            <input id="auth_user" placeholder="اسم المستخدم">
-            <input id="auth_pass" type="password" placeholder="كلمة المرور">
-            <button class="btn btn-primary" style="width:100%; justify-content:center" onclick="submitAuth()">تأكيد الدخول</button>
-            <p id="switchAuth" onclick="toggleAuthMode()" style="text-align:center; font-size:13px; cursor:pointer; color:var(--primary); margin-top:20px;">ليس لديك حساب؟ سجل الآن</p>
+            <h2 id="authT">دخول</h2>
+            <input id="userInp" placeholder="اسم المستخدم">
+            <input id="passInp" type="password" placeholder="كلمة المرور">
+            <button class="btn btn-p" style="width:100%; justify-content:center" onclick="auth()">تأكيد</button>
+            <p onclick="reg=!reg; authT.innerText=reg?'حساب جديد':'دخول'" style="text-align:center; cursor:pointer; color:var(--p); margin-top:20px">تبديل بين التسجيل والدخول</p>
         </div>
     </div>
 
-    <div id="profileModal" class="modal">
-        <div class="modal-body">
-            <h3>تعديل ملفك الشخصي</h3>
-            <div style="text-align:center; margin-bottom:20px">
-                <img id="edit_pic_preview" src="" class="user-pic" style="width:80px; height:80px;">
-                <input id="edit_pic_url" placeholder="رابط صورة الملف" oninput="document.getElementById('edit_pic_preview').src=this.value">
-            </div>
-            <input id="edit_display_name" placeholder="الاسم المستعار">
-            <textarea id="edit_bio" placeholder="نبذة عنك..." rows="3"></textarea>
-            <button class="btn btn-primary" style="width:100%; justify-content:center" onclick="updateProfileData()">حفظ التعديلات</button>
-            <button class="btn" style="width:100%; justify-content:center; background:none; color:var(--secondary)" onclick="closeModal('profileModal')">إلغاء</button>
+    <div id="chatModal" class="modal">
+        <div class="modal-body" style="height: 80vh; display: flex; flex-direction: column;">
+            <h4 id="chatTitle">المحادثة</h4>
+            <div id="chatMsgs" style="flex:1; overflow-y:auto; background:#1a1a1a; border-radius:15px; padding:15px; margin-bottom:10px"></div>
+            <div style="display:flex; gap:8px"><input id="chatInp" placeholder="اكتب..." style="margin:0"><button class="btn btn-p" onclick="pushMsg()">إرسال</button></div>
+            <button onclick="closeM()" style="background:none; border:none; color:gray; cursor:pointer; margin-top:10px">رجوع</button>
         </div>
+    </div>
+
+    <div class="bottom-nav">
+        <span class="material-icons-round" onclick="location.reload()">home</span>
+        <span class="material-icons-round" onclick="triggerPost()" style="color:var(--p); font-size:35px">add_circle</span>
+        <span class="material-icons-round" onclick="alert('قريباً')">account_circle</span>
     </div>
 
     <script>
-        let isRegisterMode = false;
-        let userToken = localStorage.getItem('token');
-        let currentPostID = null;
+        let reg=false, token=localStorage.getItem('token'), isAdmin=localStorage.getItem('isAdmin')==='true', selImg="", activeChat=null;
 
-        // تهيئة الواجهة بناءً على حالة المستخدم
-        if(userToken) {
-            document.getElementById('authDisplay').innerHTML = `
-                <button class="btn" onclick="userLogout()" style="background:#fee2e2; color:#ef4444; padding:8px 15px;">خروج</button>
-            `;
+        if(token) document.getElementById('pubBox').style.display='block';
+        if(isAdmin) document.getElementById('adminIcon').style.display='block';
+
+        function closeM() { document.querySelectorAll('.modal').forEach(m=>m.style.display='none'); }
+
+        function previewImg(input) {
+            const r = new FileReader();
+            r.onload = e => { selImg = e.target.result; pImgPrev.src=e.target.result; pImgPrev.style.display='block'; };
+            r.readAsDataURL(input.files[0]);
         }
 
-        // تبديل الوضع الليلي
-        document.getElementById('themeToggle').onclick = () => {
-            const body = document.body;
-            const mode = body.getAttribute('data-theme') === 'light' ? 'dark' : 'light';
-            body.setAttribute('data-theme', mode);
-            document.getElementById('themeToggle').innerText = mode === 'light' ? 'dark_mode' : 'light_mode';
-        };
-
-        function openModal(id) { document.getElementById(id).style.display = 'flex'; }
-        function closeModal(id) { document.getElementById(id).style.display = 'none'; }
-
-        function toggleAuthMode() {
-            isRegisterMode = !isRegisterMode;
-            document.getElementById('modalTitle').innerText = isRegisterMode ? 'إنشاء حساب جديد' : 'أهلاً بك مجدداً';
-            document.getElementById('switchAuth').innerText = isRegisterMode ? 'لديك حساب بالفعل؟ سجل دخول' : 'ليس لديك حساب؟ سجل الآن';
-        }
-
-        async function submitAuth() {
-            const u = document.getElementById('auth_user').value;
-            const p = document.getElementById('auth_pass').value;
-            const res = await fetch('/auth', {
-                method: 'POST',
-                headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify({username: u, password: p, register: isRegisterMode})
-            });
-            const data = await res.json();
-            if(res.ok) {
-                if(!isRegisterMode) {
-                    localStorage.setItem('token', data.token);
-                    localStorage.setItem('username', data.username);
-                    location.reload();
-                } else {
-                    alert("تم التسجيل! يمكنك الآن تسجيل الدخول.");
-                    toggleAuthMode();
-                }
-            } else alert(data.msg);
-        }
-
-        function userLogout() {
-            localStorage.clear();
-            location.reload();
+        async function auth() {
+            const r = await fetch('/auth', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({username:userInp.value, password:passInp.value, register:reg})});
+            const d = await r.json();
+            if(r.ok && !reg) { localStorage.setItem('token', d.token); localStorage.setItem('isAdmin', d.isAdmin); location.reload(); }
+            else if(r.ok) { alert("تم التسجيل!"); reg=false; authT.innerText='دخول'; } else alert(d.msg);
         }
 
         async function loadFeed() {
-            const res = await fetch('/feed');
-            const data = await res.json();
-            const container = document.getElementById('postsList');
-            container.innerHTML = data.map(p => `
-                <div class="card" onclick="showPost(${p.id})">
-                    <div class="user-meta">
-                        <img src="${p.profile_pic}" class="user-pic">
-                        <div>
-                            <div style="font-weight:700;">${p.display_name}</div>
-                            <div style="font-size:12px; color:var(--secondary)">@${p.username} • ${new Date(p.date).toLocaleDateString('ar')}</div>
+            const r = await fetch('/feed');
+            const data = await r.json();
+            feedArea.innerHTML = data.map(p => `
+                <div class="card">
+                    <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:12px">
+                        <div style="display:flex; gap:12px; align-items:center">
+                            <img src="${p.profile_pic||'https://i.pravatar.cc/150?u='+p.username}" class="u-img">
+                            <div>
+                                <strong>${p.display_name} ${p.is_verified?'<span style="color:#1d9bf0">✔️</span>':''}</strong>
+                                <div style="font-size:12px; color:gray">@${p.username}</div>
+                            </div>
                         </div>
+                        <span class="material-icons-round" style="color:var(--p); cursor:pointer" onclick="openChat(${p.user_id}, '${p.display_name}')">forum</span>
                     </div>
-                    <div class="post-text">${p.content}</div>
-                    <div class="post-stats">
-                        <div class="stat-item"><span class="material-icons-round" style="font-size:18px">visibility</span> ${p.views}</div>
-                        <div class="stat-item"><span class="material-icons-round" style="font-size:18px">chat_bubble_outline</span> ${p.comment_count}</div>
-                    </div>
+                    <p style="font-size:17px; line-height:1.6">${p.content}</p>
+                    ${p.post_image ? `<img src="${p.post_image}" style="width:100%; border-radius:15px; margin-top:10px">` : ''}
+                    ${isAdmin && p.username !== ADMIN_USER ? `
+                        <div style="display:flex; gap:8px; margin-top:10px">
+                            <button onclick="admDo(${p.user_id}, 'ip_ban')" style="background:none; border:1px solid red; color:red; border-radius:10px; font-size:11px; cursor:pointer; padding:5px">حظر</button>
+                            <button onclick="admDo(${p.user_id}, 'verify')" style="background:none; border:1px solid #1d9bf0; color:#1d9bf0; border-radius:10px; font-size:11px; cursor:pointer; padding:5px">توثيق</button>
+                        </div>
+                    ` : ''}
                 </div>
             `).join('');
         }
 
-        async function showPost(pid) {
-            currentPostID = pid;
-            const res = await fetch('/post/'+pid);
-            const data = await res.json();
-            const p = data.post;
-            
-            // تحديث رابط المتصفح
-            window.history.pushState({}, '', '/post/'+pid);
-            document.getElementById('postOverlay').style.display = 'block';
-            
-            document.getElementById('singlePostData').innerHTML = `
-                <div class="card">
-                    <div class="user-meta">
-                        <img src="${p.profile_pic}" class="user-pic">
-                        <div>
-                            <div style="font-weight:700;">${p.display_name}</div>
-                            <div style="font-size:12px; color:var(--secondary)">@${p.username}</div>
-                        </div>
-                    </div>
-                    <div class="post-text" style="font-size:22px;">${p.content}</div>
-                    <div style="font-size:12px; color:var(--secondary)">نُشر في: ${new Date(p.date).toLocaleString('ar-EG')} • المشاهدات: ${p.views}</div>
+        async function openChat(id, name) {
+            if(!token) return authModal.style.display='flex';
+            activeChat = id; chatTitle.innerText = "محادثة " + name; chatModal.style.display='flex';
+            const r = await fetch('/chat/'+id, {headers:{'Authorization':'Bearer '+token}});
+            const msgs = await r.json();
+            chatMsgs.innerHTML = msgs.map(m => `
+                <div style="text-align:${m.sender_id==id?'right':'left'}; margin-bottom:10px">
+                    <span style="background:${m.sender_id==id?'#333':var(--p)}; padding:8px 15px; border-radius:18px; display:inline-block; max-width:80%">${m.text}</span>
                 </div>
-                
-                <div class="comment-section">
-                    <h4>التعليقات (${data.comments.length})</h4>
-                    ${userToken ? `
-                        <textarea id="commentInput" placeholder="اكتب تعليقك هنا..." rows="3"></textarea>
-                        <button class="btn btn-primary" onclick="sendComment(${pid})">إرسال تعليق</button>
-                    ` : '<p style="text-align:center; color:var(--secondary)">سجل دخول لتتمكن من التعليق</p>'}
-                    
-                    <div id="commentsList" style="margin-top:20px">
-                        ${data.comments.map(c => `
-                            <div class="comment-card">
-                                <img src="${c.profile_pic}" style="width:30px; height:30px; border-radius:50%">
-                                <div>
-                                    <strong style="font-size:13px">${c.display_name}</strong>
-                                    <div style="font-size:14px">${c.content}</div>
-                                </div>
-                            </div>
-                        `).join('')}
-                    </div>
-                </div>
-            `;
+            `).join('');
+            chatMsgs.scrollTop = chatMsgs.scrollHeight;
         }
 
-        async function sendComment(pid) {
-            const content = document.getElementById('commentInput').value;
-            if(!content) return;
-            const res = await fetch('/comment', {
-                method: 'POST',
-                headers: {'Authorization': 'Bearer '+userToken, 'Content-Type': 'application/json'},
-                body: JSON.stringify({pid: pid, content: content})
-            });
-            if(res.ok) showPost(pid);
+        async function pushMsg() {
+            if(!chatInp.value) return;
+            await fetch('/chat/'+activeChat, {method:'POST', headers:{'Authorization':'Bearer '+token, 'Content-Type':'application/json'}, body: JSON.stringify({text: chatInp.value})});
+            chatInp.value=""; openChat(activeChat, "");
         }
 
-        function exitPostView() {
-            document.getElementById('postOverlay').style.display = 'none';
-            window.history.pushState({}, '', '/');
-            loadFeed();
+        async function openAdmin() {
+            adminModal.style.display='flex';
+            const r = await fetch('/admin/data', {headers:{'Authorization':'Bearer '+token}});
+            const d = await r.json();
+            bannedData.innerHTML = "<h4>المحظورين</h4>" + d.users.map(u => `<div style="display:flex; justify-content:space-between; margin-bottom:5px"><span>${u.username}</span> <button onclick="admDo(${u.id}, 'unban_user')">فك</button></div>`).join('') + "<h4>IP</h4>" + d.ips.map(i => `<div style="display:flex; justify-content:space-between; margin-bottom:5px"><span>${i.ip}</span> <button onclick="admDo(0, 'unban_ip', '${i.ip}')">فك</button></div>`).join('');
         }
 
-        async function openProfile() {
-            if(!userToken) return openModal('authModal');
-            const res = await fetch('/profile/me', { headers: {'Authorization': 'Bearer '+userToken} });
-            const d = await res.json();
-            document.getElementById('edit_display_name').value = d.display_name;
-            document.getElementById('edit_bio').value = d.bio || '';
-            document.getElementById('edit_pic_url').value = d.profile_pic;
-            document.getElementById('edit_pic_preview').src = d.profile_pic;
-            openModal('profileModal');
+        async function admDo(id, act, ip='') {
+            await fetch('/admin/action', {method:'POST', headers:{'Authorization':'Bearer '+token, 'Content-Type':'application/json'}, body: JSON.stringify({target_id:id, action:act, ip:ip})});
+            if(act.includes('unban')) openAdmin(); else loadFeed();
         }
 
-        async function updateProfileData() {
-            await fetch('/profile/update', {
-                method: 'POST',
-                headers: {'Authorization': 'Bearer '+userToken, 'Content-Type': 'application/json'},
-                body: JSON.stringify({
-                    display_name: document.getElementById('edit_display_name').value,
-                    bio: document.getElementById('edit_bio').value,
-                    profile_pic: document.getElementById('edit_pic_url').value
-                })
-            });
+        async function sendPost() {
+            if(!pText.value && !selImg) return;
+            await fetch('/post', {method:'POST', headers:{'Authorization':'Bearer '+token, 'Content-Type':'application/json'}, body: JSON.stringify({content: pText.value, image: selImg})});
             location.reload();
         }
 
-        function triggerPost() {
-            if(!userToken) return openModal('authModal');
-            const text = prompt("ماذا تنشر؟");
-            if(text) {
-                fetch('/post', {
-                    method: 'POST',
-                    headers: {'Authorization': 'Bearer '+userToken, 'Content-Type': 'application/json'},
-                    body: JSON.stringify({content: text})
-                }).then(() => loadFeed());
-            }
-        }
-
-        // معالجة الروابط المباشرة (Permalink) عند التحميل
+        function triggerPost() { if(!token) authModal.style.display='flex'; else pText.focus(); }
         loadFeed();
-        const path = window.location.pathname;
-        if(path.startsWith('/post/')) {
-            const pid = path.split('/')[2];
-            showPost(pid);
-        }
+        window.onclick = e => { if(e.target.className==='modal') closeM(); }
     </script>
 </body>
 </html>
 """
 
 @app.route('/')
-@app.route('/post/<int:pid>')
-def index(pid=None):
-    return render_template_string(INDEX_HTML)
+def index(): return render_template_string(HTML_TEMPLATE)
 
-# --- تشغيل التطبيق ليتوافق مع الاستضافات (0.0.0.0 & Port 10000) ---
 if __name__ == '__main__':
-    # الحصول على المنفذ من المتغيرات البيئية (Render/Railway تضع هذا تلقائياً)
-    target_port = int(os.environ.get('PORT', 10000))
-    # التشغيل على host 0.0.0.0 ليكون متاحاً للإنترنت العام
-    app.run(host='0.0.0.0', port=target_port, debug=False)
+    port = int(os.environ.get('PORT', 10000))
+    app.run(host='0.0.0.0', port=port, debug=False)
