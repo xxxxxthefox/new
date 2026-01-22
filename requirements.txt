@@ -4,4 +4,3 @@ Flask-Limiter
 Flask-Talisman
 bcrypt
 bleach
-gunicorn
